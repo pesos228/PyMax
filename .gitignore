@@ -117,6 +117,8 @@ cache/
 # remove them from this .gitignore (for example: remove poetry.lock or uv.lock).
 tests2/
 tests
+!tests/
+!tests/*.py
 
 
 # Bad dev's requirements

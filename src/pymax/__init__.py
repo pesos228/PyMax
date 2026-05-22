@@ -16,8 +16,10 @@ from .exceptions import (
     WebSocketNotConnectedError,
 )
 from .files import (
+    Audio,
     File,
     Photo,
+    Voice,
 )
 from .static.enum import (
     AccessType,
@@ -63,6 +65,7 @@ __author__ = "ink-developer"
 __all__ = [
     # Перечисления и константы
     "AccessType",
+    "Audio",
     "AttachType",
     "AuthType",
     # Типы данных
@@ -109,5 +112,6 @@ __all__ = [
     "User",
     "VideoAttach",
     "VideoRequest",
+    "Voice",
     "WebSocketNotConnectedError",
 ]

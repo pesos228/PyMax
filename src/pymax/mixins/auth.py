@@ -218,9 +218,8 @@ class AuthMixin(ClientProtocol):
             self.logger.critical("Failed to login, token not received")
             raise ValueError("Failed to login, token not received")
 
-        self._token = token
-        self._database.update_auth_token((self._device_id), self._token)
-        self.logger.info("Login successful, token saved to database")
+        self._save_auth_token(token)
+        self.logger.info("Login successful, token saved")
 
     async def _poll_qr_login(self, track_id: str, poll_interval: int) -> bool:
         self.logger.info("Polling for QR login confirmation")
@@ -374,13 +373,13 @@ class AuthMixin(ClientProtocol):
             raise ValueError("Failed to register, token not received")
 
         data = await self._submit_reg_info(first_name, last_name, token)
-        self._token = data.get("token")
-        if not self._token:
+        auth_token = data.get("token")
+        if not auth_token:
             self.logger.critical("Failed to register, token not received")
             raise ValueError("Failed to register, token not received")
+        self._save_auth_token(auth_token)
 
         self.logger.info("Registration successful")
-        self.logger.info("Token: %s", self._token)
         self.logger.warning(
             "IMPORTANT: Use this token ONLY with device_type='DESKTOP' and the special init user agent"
         )

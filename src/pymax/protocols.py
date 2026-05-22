@@ -35,7 +35,7 @@ class ClientProtocol(ABC):
         self.logger = logger
         self._users: dict[int, User] = {}
         self.chats: list[Chat] = []
-        self._database: Database
+        self._database: Database | None
         self._device_id: UUID
         self.uri: str
         self.is_connected: bool = False
@@ -55,6 +55,7 @@ class ClientProtocol(ABC):
         self.reconnect: bool
         self.headers: UserAgentPayload
         self._database_path: Path
+        self._persist_session: bool
         self._ws: websockets.ClientConnection | None = None
         self._seq: int = 0
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
@@ -120,4 +121,7 @@ class ClientProtocol(ABC):
     def _create_safe_task(
         self, coro: Awaitable[Any], name: str | None = None
     ) -> asyncio.Task[Any]:
+        pass
+
+    def _save_auth_token(self, token: str) -> None:
         pass

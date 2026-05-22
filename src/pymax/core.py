@@ -9,7 +9,7 @@ import time
 from collections.abc import Awaitable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from typing_extensions import override
 
@@ -95,6 +95,7 @@ class MaxClient(ApiMixin, WebSocketMixin, BaseClient):
         logger: logging.Logger | None = None,
         reconnect: bool = True,
         reconnect_delay: float = 1.0,
+        persist_session: bool = True,
     ) -> None:
         self.logger = logger or logging.getLogger(f"{__name__}")
         self.uri: str = uri
@@ -121,9 +122,13 @@ class MaxClient(ApiMixin, WebSocketMixin, BaseClient):
 
         self._work_dir: str = work_dir
         self._database_path: Path = Path(work_dir) / session_name
-        self._database_path.parent.mkdir(parents=True, exist_ok=True)
-        self._database_path.touch(exist_ok=True)
-        self._database = Database(self._work_dir)
+        self._persist_session = persist_session
+        if self._persist_session:
+            self._database_path.parent.mkdir(parents=True, exist_ok=True)
+            self._database_path.touch(exist_ok=True)
+            self._database: Database | None = Database(self._work_dir)
+        else:
+            self._database = None
 
         self._incoming: asyncio.Queue[dict[str, Any]] | None = None
         self._outgoing: asyncio.Queue[dict[str, Any]] | None = None
@@ -139,10 +144,18 @@ class MaxClient(ApiMixin, WebSocketMixin, BaseClient):
         self._circuit_breaker: bool = False
         self._last_error_time: float = 0.0
 
-        self._device_id = device_id if device_id is not None else self._database.get_device_id()
+        stored_device_id = (
+            self._database.get_device_id() if self._database is not None else None
+        )
+        self._device_id = device_id or stored_device_id or uuid4()
         self._file_upload_waiters: dict[int, asyncio.Future[dict[str, Any]]] = {}
 
-        self._token = self._database.get_auth_token() or token
+        stored_token = (
+            self._database.get_auth_token() if self._database is not None else None
+        )
+        self._token = token or stored_token
+        if token is not None:
+            self._save_auth_token(token)
         if headers is None:
             headers = self._default_headers()
         self.user_agent = headers
@@ -183,6 +196,30 @@ class MaxClient(ApiMixin, WebSocketMixin, BaseClient):
             self.uri,
             self._work_dir,
         )
+
+    @property
+    def auth_token(self) -> str | None:
+        return self._token
+
+    @property
+    def device_id(self) -> UUID:
+        return self._device_id
+
+    @property
+    def persist_session(self) -> bool:
+        return self._persist_session
+
+    def export_session(self) -> dict[str, str | None]:
+        return {
+            "phone": self.phone,
+            "token": self._token,
+            "device_id": str(self._device_id),
+        }
+
+    def _save_auth_token(self, token: str) -> None:
+        self._token = token
+        if self._database is not None:
+            self._database.update_auth_token(self._device_id, token)
 
     @staticmethod
     def _default_headers() -> UserAgentPayload:
@@ -263,8 +300,7 @@ class MaxClient(ApiMixin, WebSocketMixin, BaseClient):
 
         if not token:
             raise ValueError("Login response did not contain tokenAttrs.LOGIN.token")
-        self._token = token
-        self._database.update_auth_token(self._device_id, token)
+        self._save_auth_token(token)
         if start:
             while True:
                 try:
@@ -299,8 +335,12 @@ class MaxClient(ApiMixin, WebSocketMixin, BaseClient):
                         raise ValueError("First name is required for registration")
                     await self._register(self.first_name, self.last_name)
 
-                if self._token and self._database.get_auth_token() is None:
-                    self._database.update_auth_token(self._device_id, self._token)
+                if (
+                    self._token
+                    and self._database is not None
+                    and self._database.get_auth_token() is None
+                ):
+                    self._save_auth_token(self._token)
 
                 if self._token is None:
                     await self._login()

@@ -100,9 +100,22 @@ class UploadPayload(CamelModel):
     profile: bool = False
 
 
+class AudioUploadPayload(CamelModel):
+    uploader_type: int = 1
+    type: int = 2
+    count: int = 1
+
+
 class AttachPhotoPayload(CamelModel):
     type: AttachType = Field(default=AttachType.PHOTO, alias="_type")
     photo_token: str
+
+
+class AttachAudioPayload(CamelModel):
+    type: AttachType = Field(default=AttachType.AUDIO, alias="_type")
+    duration: int
+    wave: bytes
+    token: str
 
 
 class VideoAttachPayload(CamelModel):
@@ -126,7 +139,9 @@ class SendMessagePayloadMessage(CamelModel):
     text: str
     cid: int
     elements: list[MessageElement]
-    attaches: list[AttachPhotoPayload | AttachFilePayload | VideoAttachPayload]
+    attaches: list[
+        AttachPhotoPayload | AttachFilePayload | VideoAttachPayload | AttachAudioPayload
+    ]
     link: ReplyLink | None = None
 
 
@@ -141,7 +156,9 @@ class EditMessagePayload(CamelModel):
     message_id: int
     text: str
     elements: list[MessageElement]
-    attaches: list[AttachPhotoPayload | AttachFilePayload | VideoAttachPayload]
+    attaches: list[
+        AttachPhotoPayload | AttachFilePayload | VideoAttachPayload | AttachAudioPayload
+    ]
 
 
 class DeleteMessagePayload(CamelModel):

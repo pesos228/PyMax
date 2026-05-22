@@ -8,12 +8,14 @@ from aiofiles import open as aio_open
 from aiohttp import ClientSession, TCPConnector
 
 from pymax.exceptions import Error
-from pymax.files import File, Photo, Video
+from pymax.files import Audio, File, Photo, Video
 from pymax.formatting import Formatting
 from pymax.payloads import (
     AddReactionPayload,
+    AttachAudioPayload,
     AttachFilePayload,
     AttachPhotoPayload,
+    AudioUploadPayload,
     DeleteMessagePayload,
     EditMessagePayload,
     FetchHistoryPayload,
@@ -47,6 +49,8 @@ from pymax.utils import MixinsUtils
 
 class MessageMixin(ClientProtocol):
     CHUNK_SIZE = 6 * 1024 * 1024
+    AUDIO_SEND_RETRIES = 8
+    AUDIO_SEND_RETRY_DELAY = 1.5
 
     async def _upload_file(self, file: File) -> None | Attach:
         try:
@@ -313,7 +317,96 @@ class MessageMixin(ClientProtocol):
             self.logger.exception("Upload photo failed: %s", str(e))
             return None
 
-    async def _upload_attachment(self, attach: Photo | File | Video) -> dict | None:
+    async def _upload_audio(self, audio: Audio) -> dict | None:
+        if self._socket is None:
+            raise Error(
+                "audio_unsupported",
+                "Audio messages require SocketMaxClient.",
+                "Audio Error",
+            )
+
+        try:
+            self.logger.info("Uploading audio")
+            prepared = await audio.prepare()
+            payload = AudioUploadPayload().model_dump(by_alias=True)
+            data = await self._send_and_wait(
+                opcode=Opcode.VIDEO_UPLOAD,
+                payload=payload,
+            )
+
+            if data.get("payload", {}).get("error"):
+                MixinsUtils.handle_error(data)
+
+            info = data.get("payload", {}).get("info", [])
+            upload_info = info[0] if info else {}
+            url = upload_info.get("url")
+            token = upload_info.get("token")
+            if not url or not token:
+                raise Error(
+                    "audio_upload_failed",
+                    "No upload URL or token received",
+                    "Audio Upload Error",
+                )
+
+            file_size = prepared.path.stat().st_size
+            headers = {
+                "Content-Type": "application/octet-stream",
+                "Content-Disposition": f"attachment; filename={prepared.file_name}",
+                "Content-Length": str(file_size),
+                "Content-Range": f"bytes 0-{file_size - 1}/{file_size}",
+                "User-Agent": self.user_agent.header_user_agent,
+                "Connection": "keep-alive",
+            }
+
+            async def audio_generator():
+                async with aio_open(prepared.path, "rb") as file:
+                    while True:
+                        chunk = await file.read(self.CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        yield chunk
+
+            timeout = aiohttp.ClientTimeout(
+                total=None,
+                sock_read=None,
+                sock_connect=30,
+            )
+            async with (
+                ClientSession(timeout=timeout) as session,
+                session.post(
+                    url=url,
+                    headers=headers,
+                    data=audio_generator(),
+                ) as response,
+            ):
+                if response.status != HTTPStatus.OK:
+                    body = await response.text()
+                    raise Error(
+                        "audio_upload_failed",
+                        f"Upload failed with status {response.status}: {body[:300]}",
+                        "Audio Upload Error",
+                    )
+
+            self.logger.info(
+                "Audio uploaded: size=%d duration=%dms wave=%d bytes min=%d max=%d",
+                file_size,
+                prepared.duration_ms,
+                len(prepared.wave),
+                min(prepared.wave),
+                max(prepared.wave),
+            )
+            return AttachAudioPayload(
+                duration=prepared.duration_ms,
+                wave=prepared.wave,
+                token=token,
+            ).model_dump(by_alias=True)
+        finally:
+            audio.cleanup()
+
+    async def _upload_attachment(
+        self,
+        attach: Photo | File | Video | Audio,
+    ) -> dict | None:
         if isinstance(attach, Photo):
             uploaded = await self._upload_photo(attach)
             if uploaded and uploaded.photo_token:
@@ -323,23 +416,83 @@ class MessageMixin(ClientProtocol):
         elif isinstance(attach, File):
             uploaded = await self._upload_file(attach)
             if uploaded and uploaded.file_id:
-                return AttachFilePayload(file_id=uploaded.file_id).model_dump(by_alias=True)
+                return AttachFilePayload(file_id=uploaded.file_id).model_dump(
+                    by_alias=True
+                )
         elif isinstance(attach, Video):
             uploaded = await self._upload_video(attach)
             if uploaded and uploaded.video_id and uploaded.token:
                 return VideoAttachPayload(
                     video_id=uploaded.video_id, token=uploaded.token
                 ).model_dump(by_alias=True)
+        elif isinstance(attach, Audio):
+            return await self._upload_audio(attach)
         self.logger.error(f"Attachment upload failed for {attach}")
         return None
+
+    def _is_audio_attachment(self, attach: dict) -> bool:
+        attach_type = attach.get("_type")
+        return (
+            attach_type == AttachType.AUDIO
+            or attach_type == AttachType.AUDIO.value
+        )
+
+    async def _send_message_payload(
+        self,
+        payload: dict,
+        has_audio: bool,
+    ) -> Message:
+        attempts = self.AUDIO_SEND_RETRIES + 1 if has_audio else 1
+
+        for attempt in range(1, attempts + 1):
+            data = await self._send_and_wait(
+                opcode=Opcode.MSG_SEND,
+                payload=payload,
+            )
+            raw_payload = data.get("payload", {})
+            error = raw_payload.get("error")
+
+            if not error:
+                msg = Message.from_dict(raw_payload) if raw_payload else None
+                self.logger.debug("send_message result: %r", msg)
+                if not msg:
+                    raise Error(
+                        "no_message",
+                        "Message data missing in response",
+                        "Message Error",
+                    )
+                return msg
+
+            if (
+                has_audio
+                and error == "attachment.not.ready"
+                and attempt < attempts
+            ):
+                self.logger.info(
+                    "Audio attachment is still processing; retrying MSG_SEND "
+                    "attempt=%d/%d delay=%.1fs",
+                    attempt,
+                    self.AUDIO_SEND_RETRIES,
+                    self.AUDIO_SEND_RETRY_DELAY,
+                )
+                await asyncio.sleep(self.AUDIO_SEND_RETRY_DELAY)
+                continue
+
+            MixinsUtils.handle_error(data)
+
+        raise Error(
+            "send_failed",
+            "Message send retry loop exited unexpectedly",
+            "Message Error",
+        )
 
     async def send_message(
         self,
         text: str,
         chat_id: int,
         notify: bool = True,
-        attachment: Photo | File | Video | None = None,
-        attachments: list[Photo | File | Video] | None = None,
+        attachment: Photo | File | Video | Audio | None = None,
+        attachments: list[Photo | File | Video | Audio] | None = None,
         reply_to: int | None = None,
         use_queue: bool = False,
     ) -> Message | None:
@@ -352,10 +505,10 @@ class MessageMixin(ClientProtocol):
         :type chat_id: int
         :param notify: Флаг оповещения о новом сообщении. По умолчанию True.
         :type notify: bool
-        :param attachment: Одно вложение (фото, файл или видео).
-        :type attachment: Photo | File | Video | None
+        :param attachment: Одно вложение (фото, файл, видео или аудио).
+        :type attachment: Photo | File | Video | Audio | None
         :param attachments: Список множественных вложений.
-        :type attachments: list[Photo | File | Video] | None
+        :type attachments: list[Photo | File | Video | Audio] | None
         :param reply_to: Идентификатор сообщения для ответа.
         :type reply_to: int | None
         :param use_queue: Использовать очередь для отправки. По умолчанию False.
@@ -367,16 +520,24 @@ class MessageMixin(ClientProtocol):
 
         self.logger.info("Sending message to chat_id=%s notify=%s", chat_id, notify)
         if attachments and attachment:
-            self.logger.warning("Both photo and photos provided; using photos")
+            self.logger.warning(
+                "Both attachment and attachments provided; using attachments"
+            )
             attachment = None
 
         attaches = []
+        has_audio = False
         if attachment:
             self.logger.info("Uploading attachment for message")
             result = await self._upload_attachment(attachment)
             if not result:
-                raise Error("upload_failed", "Failed to upload attachment", "Upload Error")
+                raise Error(
+                    "upload_failed",
+                    "Failed to upload attachment",
+                    "Upload Error",
+                )
             attaches.append(result)
+            has_audio = has_audio or self._is_audio_attachment(result)
 
         elif attachments:
             self.logger.info("Uploading multiple attachments for message")
@@ -384,11 +545,27 @@ class MessageMixin(ClientProtocol):
                 result = await self._upload_attachment(p)
                 if result:
                     attaches.append(result)
+                    has_audio = has_audio or self._is_audio_attachment(result)
                 else:
-                    raise Error("upload_failed", "Failed to upload attachment", "Upload Error")
+                    raise Error(
+                        "upload_failed",
+                        "Failed to upload attachment",
+                        "Upload Error",
+                    )
 
             if not attaches:
-                raise Error("upload_failed", "All attachments failed to upload", "Upload Error")
+                raise Error(
+                    "upload_failed",
+                    "All attachments failed to upload",
+                    "Upload Error",
+                )
+
+        if has_audio and use_queue:
+            raise Error(
+                "audio_queue_unsupported",
+                "Audio messages cannot be sent through the outgoing queue.",
+                "Audio Error",
+            )
 
         elements = []
         clean_text = None
@@ -396,7 +573,8 @@ class MessageMixin(ClientProtocol):
         if raw_elements:
             clean_text = parsed_text
         elements = [
-            MessageElement(type=e.type, length=e.length, from_=e.from_) for e in raw_elements
+            MessageElement(type=e.type, length=e.length, from_=e.from_)
+            for e in raw_elements
         ]
 
         payload = SendMessagePayload(
@@ -416,17 +594,23 @@ class MessageMixin(ClientProtocol):
             self.logger.debug("Message queued for sending")
             return None
 
-        data = await self._send_and_wait(opcode=Opcode.MSG_SEND, payload=payload)
+        return await self._send_message_payload(payload, has_audio=has_audio)
 
-        if data.get("payload", {}).get("error"):
-            MixinsUtils.handle_error(data)
-
-        msg = Message.from_dict(data["payload"]) if data.get("payload") else None
-        self.logger.debug("send_message result: %r", msg)
-        if not msg:
-            raise Error("no_message", "Message data missing in response", "Message Error")
-
-        return msg
+    async def send_voice(
+        self,
+        chat_id: int,
+        audio: Audio,
+        text: str = "",
+        notify: bool = True,
+        reply_to: int | None = None,
+    ) -> Message | None:
+        return await self.send_message(
+            chat_id=chat_id,
+            text=text,
+            notify=notify,
+            attachment=audio,
+            reply_to=reply_to,
+        )
 
     async def edit_message(
         self,
