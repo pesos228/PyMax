@@ -257,9 +257,9 @@ class Audio(BaseFile):
             "-c:a",
             "libopus",
             "-b:a",
-            "32k",
+            "48k",
             "-application",
-            "voip",
+            "audio",
             str(output),
         )
         if returncode != 0:
